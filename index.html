@@ -79,7 +79,7 @@
 </head>
 <body>
 <header>
-  <h1>&#x1F68C; Bus Follower <span id="ver" style="font-size:0.6em;opacity:0.7;font-weight:normal;">v6.33</span></h1>
+  <h1>&#x1F68C; Bus Follower <span id="ver" style="font-size:0.6em;opacity:0.7;font-weight:normal;">v6.35</span></h1>
   <div class="seg">
     <button id="btnAM" class="on">AM</button>
     <button id="btnPM">PM</button>
@@ -392,10 +392,17 @@ function recordEvent(r, s, isTest, rawMsg, isFinal, whenISO, deferUI, dev, kind,
   if (!deferUI) refreshDatePicker();
   return true;
 }
+/* ===== Show test alerts (v6.34, Maintenance toggle) =====
+   Persisted per page; unset = OFF. OFF: test events stay recorded but
+   are inert — skipped here in derivation and in log rendering. */
+var SHOW_TESTS_KEY = 'follower_show_tests';
+var showTests = false;
+try { showTests = localStorage.getItem(SHOW_TESTS_KEY) === '1'; } catch (e) {}
 function stateFromEvents(r, events) {
   var st = freshRouteState();
   var list = (r === 'AM') ? AM_STOPS : PM_STOPS;
   events.forEach(function (ev) {
+    if (ev.test && !showTests) return;
     var key = (r === 'AM') ? String(ev.stop) : ev.letter;
     var t = new Date(ev.time);
     if (!st.lastUpdate || t > st.lastUpdate) st.lastUpdate = t;
@@ -1020,7 +1027,7 @@ if (HARDCODED_TOPIC) {
 }
 // Re-backfill when tab becomes visible again (mobile browsers suspend SSE in background tabs)
 
-/* ===== Live Tracker (v6.33) =====
+/* ===== Live Tracker (v6.35) =====
    Position layer: subscribes to the Firebase Realtime Database
    position records (REST/SSE, SDK-free) and glides the bus marker
    along the route line between stop events. SEPARATE from the event
@@ -1223,22 +1230,83 @@ function posSetRec(tag, rec) {
   posByTag[tag] = rec;
 }
 
+/* ===== Position route switch (v6.35) =====
+   Positions may steer the TAB (never stop state): when a device's
+   record activates for the other route — absent / inactive / route
+   flip -> active, fresh (<= POS_STALE_MS), acc-gated at intake by
+   posSetRec, and inside the current device selection — the follower
+   follows it, once per activation. Manual taps are respected until
+   the next ride's edge. Arriving at the Live view (root-PUT sync,
+   the connect catch-up, returning from History) re-evaluates once:
+   the freshest fresh-active record wins. History never switches. */
+var posSnapMode = false; // true while a root-PUT snapshot is feeding
+function posSwitchSelected(tag) {
+  // The page's own selection semantics: a device is selected unless
+  // the user deselected it (new devices start selected).
+  try { return isDevSelected(tag); } catch (e) { return true; }
+}
+function posFreshRoute(rec) {
+  if (!rec || !rec.active || typeof rec.lat !== 'number') return '';
+  var rr = String(rec.route || '').toUpperCase();
+  if (rr !== 'AM' && rr !== 'PM') return '';
+  if (Date.now() - (rec.ts || 0) > POS_STALE_MS) return '';
+  return rr;
+}
+function posArrivalSwitch() {
+  if (viewDate) return;
+  var bestRoute = '', bestTs = -1;
+  Object.keys(posByTag).forEach(function (t) {
+    if (!posSwitchSelected(t)) return;
+    var rr = posFreshRoute(posByTag[t]);
+    if (!rr) return;
+    var ts = posByTag[t].ts || 0;
+    if (ts > bestTs) { bestTs = ts; bestRoute = rr; }
+  });
+  if (bestRoute && bestRoute !== route) setRoute(bestRoute);
+}
+function posEdgeSwitch(tag, was) {
+  if (posSnapMode || viewDate) return;
+  var rr = posFreshRoute(posByTag[tag]);
+  if (!rr || rr === route) return;
+  // Continuation only if the prior record was active, same-route AND
+  // fresh: a stale record rendered nothing, so a fresh fix after a
+  // >90 s silence is a re-activation and switches like a new ride.
+  if (was && was.active && String(was.route || '').toUpperCase() === rr
+      && Date.now() - (was.ts || 0) <= POS_STALE_MS) return;
+  if (!posSwitchSelected(tag)) return;
+  setRoute(rr);
+}
 function posOnEvent(pathStr, data, isPatch) {
   if (!pathStr || pathStr === '/') {
-    if (!isPatch) posByTag = {};
-    if (data) Object.keys(data).forEach(function (t) { posSetRec(t, data[t]); });
+    if (!isPatch) {
+      // Full snapshot (initial sync / reconnect resync): re-feed with
+      // per-record edges suppressed, then evaluate arrival once.
+      posSnapMode = true;
+      posByTag = {};
+      if (data) Object.keys(data).forEach(function (t) { posSetRec(t, data[t]); });
+      posSnapMode = false;
+      posArrivalSwitch();
+      return;
+    }
+    if (data) Object.keys(data).forEach(function (t) {
+      var wasP = posByTag[t];
+      posSetRec(t, data[t]);
+      posEdgeSwitch(t, wasP);
+    });
     return;
   }
   var tag = pathStr.slice(1);
   if (data === null) { delete posByTag[tag]; return; }
+  var was = posByTag[tag];
   if (isPatch && posByTag[tag] && posByTag[tag].active) {
     var merged = {};
     Object.keys(posByTag[tag]).forEach(function (k) { merged[k] = posByTag[tag][k]; });
     Object.keys(data).forEach(function (k) { merged[k] = data[k]; });
     posSetRec(tag, merged);
-    return;
+  } else {
+    posSetRec(tag, data);
   }
-  posSetRec(tag, data);
+  posEdgeSwitch(tag, was);
 }
 
 function posSubscribe() {
@@ -1264,6 +1332,19 @@ if (posTestEl) posTestEl.addEventListener('change', function () {
     try { renderRoute(); } catch (e) {}
   }
 });
+var showTestsEl = document.getElementById('showTestsToggle');
+if (showTestsEl) {
+  showTestsEl.checked = showTests;
+  showTestsEl.addEventListener('change', function () {
+    showTests = !!showTestsEl.checked;
+    try { localStorage.setItem(SHOW_TESTS_KEY, showTests ? '1' : '0'); } catch (e) {}
+    try {
+      restoreToday(); rebuildDevStates();
+      if (viewDate) renderHistoryView(); else rebuildLiveLog();
+      renderRoute();
+    } catch (e) {}
+  });
+}
 
 /* ===== Presence heartbeat =====
    Publish-only: this page pings a derived "-presence" topic every
@@ -1356,6 +1437,7 @@ document.addEventListener('visibilitychange', function () {
       if (n > 0) {
         refreshDatePicker();
         applyStartingRoute();
+        posArrivalSwitch();
         if (!viewDate) { rebuildLiveLog(); renderRoute(); }
         addLog('Caught up: ' + n + ' new alert' + (n === 1 ? '' : 's') + ' while away.', 'SYNC', '');
       }
@@ -1590,6 +1672,7 @@ function handleMessage(raw, opts) {
     if (viewDate) return _addedOb; // history mode: accumulate silently
     if (opts && opts.silent) return _addedOb; // backfill: rendering deferred to the end
     if (torontoDateKey(_evTimeOb) !== torontoDateKey(new Date())) return _addedOb; // previous-day: history only
+    if (isTest && !showTests) return _addedOb;
     if (_rOb !== route) setRoute(_rOb); // route auto-follow (v6.21)
     var _dsOb = null;
     try {
@@ -1648,6 +1731,7 @@ function handleMessage(raw, opts) {
     if (viewDate) return _addedSk; // history mode: accumulate silently
     if (opts && opts.silent) return _addedSk; // backfill: rendering deferred to the end
     if (torontoDateKey(_evTimeSk) !== torontoDateKey(new Date())) return _addedSk; // previous-day: history only
+    if (isTest && !showTests) return _addedSk;
     if (_rSk !== route) setRoute(_rSk); // route auto-follow (v6.21 parity)
     try {
       var _keySk = _sSk ? _keyFnSk(_sSk) : null;
@@ -1713,6 +1797,7 @@ function handleMessage(raw, opts) {
                              opts && opts.time, opts && opts.deferUI, devF);
     if (viewDate || silent) return addedF;
     if (torontoDateKey(whenF) !== torontoDateKey(new Date())) return addedF;
+    if (isTest && !showTests) return addedF;
     if (r !== route) setRoute(r); // route auto-follow (v6.21): guarded switch, after the date checks
     st.complete = true; st.busIdx = list.length - 1; st.lastUpdate = whenF;
     var keyF = stopKey(list[list.length - 1]);
@@ -1748,6 +1833,7 @@ function applyArrival(r, s, isTest, rawMsg, opts, kind, devArg, lblArg) {
   if (viewDate) return added; // history mode: accumulate silently, don't touch the display
   if (opts && opts.silent) return added; // backfill: rendering deferred to the end
   if (isOld) return added; // previous-day event: history only, no live UI update
+  if (isTest && !showTests) return added;
   if (r !== route) setRoute(r); // route auto-follow (v6.21)
   st.reached[key] = true;
   st.waiting = null; // boarded: clear any waiting state
@@ -1811,6 +1897,7 @@ function applyWaiting(r, s, dev, rawMsg, opts, isTest, label) {
   if (viewDate) return added; // history mode: accumulate silently, don't touch the display
   if (opts && opts.silent) return added; // backfill: rendering deferred to the end
   if (isOld) return added; // previous-day event: history only, no live UI update
+  if (isTest && !showTests) return added;
   if (r !== route) setRoute(r); // route auto-follow (v6.21)
   lastRoute = r;
   var key = (r === 'AM') ? String(s.n) : s.letter;
@@ -1831,6 +1918,7 @@ function applyGotOff(r, s, dev, rawMsg, opts, isTest, label) {
   if (viewDate) return added; // history mode: accumulate silently, don't touch the display
   if (opts && opts.silent) return added; // backfill: rendering deferred to the end
   if (isOld) return added; // previous-day event: history only, no live UI update
+  if (isTest && !showTests) return added;
   if (r !== route) setRoute(r); // route auto-follow (v6.21)
   lastRoute = r;
   var key = (r === 'AM') ? String(s.n) : s.letter;
@@ -1850,6 +1938,7 @@ function applyFinalNew(r, dev, rawMsg, opts, isTest, lblF) {
                           opts && opts.time, opts && opts.deferUI, dev, 'newfinal', lblF ? { label: lblF } : undefined);
   if (viewDate || (opts && opts.silent)) return added;
   if (torontoDateKey(whenF) !== torontoDateKey(new Date())) return added;
+  if (isTest && !showTests) return added;
   if (r !== route) setRoute(r); // route auto-follow (v6.21)
   var st = state[r];
   st.complete = true; st.busIdx = list.length - 1; st.lastUpdate = whenF; st.waiting = null;
@@ -1951,7 +2040,7 @@ function renderHistoryView() {
     log.innerHTML = '<div id="logEmpty">No ' + route + ' events on ' + dateLabel(viewDate) + '.</div>';
   } else {
     var rev = events.slice().reverse();
-    rev.forEach(function (ev) { log.appendChild(logEntryFromEvent(route, ev)); });
+    rev.forEach(function (ev) { if (ev.test && !showTests) return; log.appendChild(logEntryFromEvent(route, ev)); });
   }
   updateDateSummary();
   renderRoute();
@@ -1963,6 +2052,7 @@ document.getElementById('dateSelect').addEventListener('change', function () {
     // Rebuild live log from today's accumulated history
     rebuildLiveLog();
     renderRoute();
+    posArrivalSwitch();
   } else {
     viewDate = v;
     renderHistoryView();
@@ -1991,7 +2081,7 @@ function rebuildLiveLog() {
     all = all.filter(function (item) { return fsel.indexOf(item.ev.dev || DEV_UNKNOWN) !== -1; });
   }
   all.sort(function (a, b) { return new Date(b.ev.time) - new Date(a.ev.time); });
-  all.forEach(function (item) { log.appendChild(logEntryFromEvent(item.r, item.ev)); });
+  all.forEach(function (item) { if (item.ev.test && !showTests) return; log.appendChild(logEntryFromEvent(item.r, item.ev)); });
 }
 // AM/PM toggle must re-render history log when in history mode
 var _origSetRoute = setRoute;
