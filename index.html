@@ -79,7 +79,7 @@
 </head>
 <body>
 <header>
-  <h1>&#x1F68C; Bus Follower <span id="ver" style="font-size:0.6em;opacity:0.7;font-weight:normal;">v6.24</span></h1>
+  <h1>&#x1F68C; Bus Follower <span id="ver" style="font-size:0.6em;opacity:0.7;font-weight:normal;">v6.32</span></h1>
   <div class="seg">
     <button id="btnAM" class="on">AM</button>
     <button id="btnPM">PM</button>
@@ -125,6 +125,7 @@
     <label class="devrow"><input type="checkbox" id="devAllToggle" checked /> <b>All devices</b></label>
     <div id="devList"></div>
   </div>
+
 
   <h2>Event log</h2>
   <div class="row">
@@ -324,6 +325,8 @@ function renderStatusFiltered(list) {
     line.textContent = 'Bus at ' + stopShort(s) + ' of ' + list.length + ' [' + devLabel(bestDev) + ']' + (route === 'PM' && best.delaySec !== null && best.delaySec !== undefined ? onBusPillSuffix(best.delaySec, (best.busIdx + 1 < list.length) ? list[best.busIdx + 1] : null) : '');
     sub.textContent = (route === 'AM' && s.t ? s.t + ' \u00B7 ' : '') +
       'Last update: ' + (best.lastUpdate ? best.lastUpdate.toLocaleTimeString() : '\u2014');
+    var _lsF = posStaleNoteFor(bestDev);
+    if (_lsF) sub.textContent += _lsF;
   } else if (best.onBus) {
     line.textContent = '\uD83D\uDCF1 [' + devLabel(bestDev) + ']' + (best.onBus.label ? ' (' + best.onBus.label + ')' : '') + ' On bus \u2014 heading to Stop ' + (best.onBus.disp || best.onBus.stop) + onBusPillSuffix(best.delaySec, stopByKey(route, String(best.onBus.stop)));
     sub.textContent = best.onBus.time ? ('Last update: ' + best.onBus.time.toLocaleTimeString()) : '';
@@ -695,6 +698,22 @@ function renderRoute() {
       icon: L.divIcon({ className: '', html: '<div class="gotofflbl">' + esc(agOffText) + '</div>', iconSize: [220, 32], iconAnchor: [110, -18] }),
       zIndexOffset: 1000, interactive: false
     }).addTo(map).bindPopup('<b>' + esc(agOffText) + '</b><br><i>Tracking stopped</i>');
+  } else if (st.waiting && st.busIdx < 0) {
+    var agWait = stopByKey(route, st.waiting);
+    // Find waiting device for the ID (same as status line)
+    var waitDevLbl = '';
+    try {
+      (function(){ try { return knownDevices() || []; } catch(e){ return []; } })().forEach(function (d) {
+        var dds = devDisplayState(route, d);
+        if (dds.waiting && !waitDevLbl) waitDevLbl = devLabel(d);
+      });
+    } catch (e) {}
+    var _wLbl = (st.waitLabel) ? ' (' + st.waitLabel + ')' : '';
+    var waitText = '\uD83D\uDCF1 ' + (waitDevLbl ? '[' + waitDevLbl + ']' + _wLbl + ' ' : '') + 'Waiting for bus at ' + (agWait ? stopShort(agWait) : 'Stop ' + st.waiting);
+    if (agWait) busMarker = L.marker([agWait.lat, agWait.lng], {
+      icon: L.divIcon({ className: '', html: '<div class="waitlbl" style="white-space:normal;line-height:1.3;padding:6px 14px;">' + esc(waitText) + '</div>', iconSize: [240, 52], iconAnchor: [120, -30] }),
+      zIndexOffset: 1000, interactive: false
+    }).addTo(map).bindPopup('<b>' + esc(waitText) + '</b>');
   } else if (st.busIdx >= 0 && st.busIdx < list.length) {
     var b = list[st.busIdx];
     busMarker = L.marker([b.lat, b.lng], {
@@ -867,6 +886,8 @@ function renderStatus() {
     line.textContent = 'Bus at ' + stopShort(s) + ' of ' + list.length + (route === 'PM' && st.delaySec !== null && st.delaySec !== undefined ? onBusPillSuffix(st.delaySec, (st.busIdx + 1 < list.length) ? list[st.busIdx + 1] : null) : '');
     sub.textContent = (route === 'AM' && s.t ? s.t + ' \u00B7 ' : '') +
       'Last update: ' + (st.lastUpdate ? st.lastUpdate.toLocaleTimeString() : '\u2014');
+    var _lsA = posStaleNoteAgg();
+    if (_lsA) sub.textContent += _lsA;
   } else if (st.onBus) {
     var obStopObj = stopByKey(route, String(st.onBus.stop));
     var obDevLbl = '';
@@ -980,6 +1001,251 @@ if (HARDCODED_TOPIC) {
 }
 // Re-backfill when tab becomes visible again (mobile browsers suspend SSE in background tabs)
 
+/* ===== Live Tracker (v6.32) =====
+   Position layer: subscribes to the Firebase Realtime Database
+   position records (REST/SSE, SDK-free) and glides the bus marker
+   along the route line between stop events. SEPARATE from the event
+   pipeline by design: hero cards, progress, the log and Minutes
+   Behind derive ONLY from events — this layer only moves the dot,
+   and only while the device's EVENT state is mid-ride on this tab.
+   A dead or absent feed changes nothing: the dot keeps today's
+   event-driven placement; past ~90 s without a fresh fix it greys
+   and the status line shows "last seen". History view: no dot. */
+var FB_BASE = 'https://bus-live-tracker-db0e1-default-rtdb.firebaseio.com';
+var FB_PATH = 'pos-4688de3309369eb335b245d1/bus';
+var POS_STALE_MS = 90000;
+var POS_ROUTE_MAX_M = 100;  // production: positions farther than this from the route are ignored (Domi's strict pick, 2026-10-31)
+var posLastDist = 0;        // distance (m) of the most recent posProject call
+var posByTag = {};     // tag -> latest record {lat,lng,acc,ts,route,active,label}
+var posAnim = {};      // marker key -> {lat, lng, marker} animated position
+var posMode = {};      // marker key -> 'live' | 'stale' (absent = event-driven)
+var posDriverTag = ''; // aggregate mode: tag whose position drives the dot
+var posTest = true;    // Position test toggle — ON by default at Domi's direction (2026-10-31, 'for now'); memory-only, never stored
+var posSrc = null;
+
+function posProject(lat, lng, pts) {
+  if (!pts || pts.length < 2) return null;
+  var kx = Math.cos(lat * Math.PI / 180) * 111320, ky = 110540;
+  var bx = lng * kx, by = lat * ky, best = null, bestD = Infinity;
+  for (var i = 0; i < pts.length - 1; i++) {
+    var ax = pts[i][1] * kx, ay = pts[i][0] * ky;
+    var cx = pts[i + 1][1] * kx, cy = pts[i + 1][0] * ky;
+    var dx = cx - ax, dy = cy - ay;
+    var len2 = dx * dx + dy * dy;
+    var t = len2 ? ((bx - ax) * dx + (by - ay) * dy) / len2 : 0;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    var px = ax + t * dx, py = ay + t * dy;
+    var d = (bx - px) * (bx - px) + (by - py) * (by - py);
+    if (d < bestD) { bestD = d; best = [py / ky, px / kx]; }
+  }
+  posLastDist = Math.sqrt(bestD);
+  return best;
+}
+
+function posDotIcon(color, stale, dev) {
+  if (dev) {
+    var c = stale ? '#8a8a8a' : color;
+    return L.divIcon({ className: '', html: '<div style="text-align:center"><div class="busdot" style="background:' + c + ';box-shadow:0 0 0 3px ' + c + '55, 0 2px 8px rgba(0,0,0,.5)"></div><div class="devbuslbl">' + esc(devLabel(dev)) + '</div></div>', iconSize: [46, 46], iconAnchor: [23, 14] });
+  }
+  return L.divIcon({ className: '', html: stale
+    ? '<div class="busdot" style="background:#8a8a8a;box-shadow:0 0 0 3px rgba(138,138,138,.35), 0 2px 8px rgba(0,0,0,.5)"></div>'
+    : '<div class="busdot"></div>', iconSize: [22, 22], iconAnchor: [11, 11] });
+}
+
+function posStaleNoteFor(tag) {
+  var rec = tag ? posByTag[tag] : null;
+  if (!rec || !rec.active || typeof rec.lat !== 'number') return '';
+  if (!posTest) { posProject(rec.lat, rec.lng, path()); if (posLastDist > POS_ROUTE_MAX_M) return ''; } // off-route: ignored in production
+  if (Date.now() - (rec.ts || 0) <= POS_STALE_MS) return '';
+  return ' \u00B7 \uD83D\uDCCD last seen ' + new Date(rec.ts).toLocaleTimeString();
+}
+function posStaleNoteAgg() { return posStaleNoteFor(posDriverTag); }
+
+function posForget(key) { delete posMode[key]; delete posAnim[key]; }
+
+function posDriveMarker(key, marker, rec, color, dev) {
+  if (!marker) return;
+  var raw = posTest && key === '__agg';
+  var target;
+  if (raw) {
+    target = [rec.lat, rec.lng];
+  } else {
+    target = posProject(rec.lat, rec.lng, path());
+    if (!target) return;
+    if (posLastDist > POS_ROUTE_MAX_M) {
+      // Production only: a phone far off the route is not the bus —
+      // ignore its position entirely. (Test mode shows everything.)
+      if (posMode[key] !== 'offroute') {
+        posForget(key);
+        if (key === '__agg') { posDriverTag = ''; try { renderRoute(); } catch (e) {} }
+        else { try { map.removeLayer(marker); } catch (e) {} }
+        posMode[key] = 'offroute';
+      }
+      return;
+    }
+    if (posMode[key] === 'offroute') posMode[key] = '';
+  }
+  var age = Date.now() - (rec.ts || 0);
+  if (age > POS_STALE_MS) {
+    if (posMode[key] !== 'stale') {
+      posMode[key] = 'stale';
+      try { marker.setIcon(posDotIcon(color, true, dev)); } catch (e) {}
+      try { renderStatus(); } catch (e) {}
+    }
+    return; // dot stays at its last live spot, greyed
+  }
+  if (posMode[key] !== 'live') {
+    posMode[key] = 'live';
+    try { marker.setIcon(posDotIcon(color, false, dev)); } catch (e) {}
+    try { renderStatus(); } catch (e) {}
+  }
+  if (raw) {
+    // Position test: true coordinates — no projection, no glide —
+    // and the popup carries the raw readout. renderRoute rebinds
+    // the event popup when the toggle turns off.
+    var pa = posAnim[key];
+    if (!pa || pa.marker !== marker) { pa = { lat: target[0], lng: target[1], marker: marker, popupTs: 0 }; posAnim[key] = pa; }
+    pa.lat = target[0]; pa.lng = target[1];
+    try { marker.setLatLng(target); } catch (e) {}
+    if (pa.popupTs !== rec.ts) {
+      pa.popupTs = rec.ts;
+      var html = '<b>Live GPS</b><br>' + rec.lat.toFixed(6) + ', ' + rec.lng.toFixed(6)
+        + '<br>acc ' + (typeof rec.acc === 'number' ? Math.round(rec.acc) + ' m' : '\u2014')
+        + ' \u00B7 ' + new Date(rec.ts).toLocaleTimeString();
+      try {
+        if (marker.getPopup && marker.getPopup()) marker.setPopupContent(html);
+        else marker.bindPopup(html);
+      } catch (e) {}
+    }
+    return;
+  }
+  var cur = posAnim[key];
+  if (!cur || cur.marker !== marker) {
+    try { marker.setLatLng(target); } catch (e) {}
+    posAnim[key] = { lat: target[0], lng: target[1], marker: marker };
+    return;
+  }
+  var nl = cur.lat + (target[0] - cur.lat) * 0.3;
+  var ng = cur.lng + (target[1] - cur.lng) * 0.3;
+  if (Math.abs(target[0] - nl) < 1e-7 && Math.abs(target[1] - ng) < 1e-7) { nl = target[0]; ng = target[1]; }
+  try { marker.setLatLng([nl, ng]); } catch (e) {}
+  cur.lat = nl; cur.lng = ng;
+}
+
+function posTick() {
+  if (viewDate) return; // history view stays position-free
+  try {
+    if (allDevsSelected()) {
+      if (posTest) {
+        // Position test mode (toggle, memory-only): draw the dot
+        // from the position feed alone — no event gate, no
+        // participation requirement. Route match still applies.
+        var tBestTag = '', tBestRec = null;
+        Object.keys(posByTag).forEach(function (t) {
+          var rec = posByTag[t];
+          if (!rec || !rec.active || typeof rec.lat !== 'number') return;
+          if (String(rec.route || '').toUpperCase() !== route) return;
+          if (!tBestRec || (rec.ts || 0) > (tBestRec.ts || 0)) { tBestRec = rec; tBestTag = t; }
+        });
+        if (!tBestRec) { posForget('__agg'); return; }
+        posDriverTag = tBestTag;
+        if (!busMarker) {
+          // Test mode must work with NO events at all (couch tests —
+          // e.g. the PM tab after midnight has no event state, so
+          // renderRoute never created the shared marker): create it.
+          try { busMarker = L.marker([tBestRec.lat, tBestRec.lng], { icon: posDotIcon(null, false, null) }).addTo(map); } catch (e) {}
+        }
+        posDriveMarker('__agg', busMarker, tBestRec, null, null);
+      } else {
+        var st = displayStateFor(route);
+        if (!(st.busIdx >= 0 && !st.complete && !st.done)) { posForget('__agg'); return; }
+        var devs = [];
+        try { devs = knownDevices() || []; } catch (e) {}
+        var bestTag = '', bestRec = null;
+        devs.forEach(function (d) {
+          var rec = posByTag[d];
+          if (!rec || !rec.active || typeof rec.lat !== 'number') return;
+          if (String(rec.route || '').toUpperCase() !== route) return;
+          try { if (!deviceParticipated(route, d)) return; } catch (e) { return; }
+          if (!bestRec || (rec.ts || 0) > (bestRec.ts || 0)) { bestRec = rec; bestTag = d; }
+        });
+        if (!bestRec) { posForget('__agg'); return; }
+        posDriverTag = bestTag;
+        posDriveMarker('__agg', busMarker, bestRec, null, null);
+      }
+    } else {
+      selectedDevices().forEach(function (dev) {
+        var m = busMarkers[dev];
+        if (!m) { posForget(dev); return; }
+        var ds = devDisplayState(route, dev);
+        var rec = posByTag[dev];
+        if (!rec || !rec.active || typeof rec.lat !== 'number'
+            || !(ds.busIdx >= 0 && !ds.complete && !ds.done)
+            || String(rec.route || '').toUpperCase() !== route) { posForget(dev); return; }
+        posDriveMarker(dev, m, rec, devColor(dev), dev);
+      });
+    }
+  } catch (e) {}
+}
+
+function posSetRec(tag, rec) {
+  if (!tag) return;
+  if (!rec || rec.active === false || typeof rec.lat !== 'number') {
+    var was = posByTag[tag];
+    posByTag[tag] = { active: false, ts: (rec && rec.ts) || 0 };
+    if (was && was.active && !viewDate) {
+      // Ride ended on the position feed: rebuild markers from events.
+      posForget(tag); posForget('__agg');
+      try { renderRoute(); } catch (e) {}
+    }
+    return;
+  }
+  if (typeof rec.acc === 'number' && rec.acc > 100) return; // followers ignore coarse fixes
+  posByTag[tag] = rec;
+}
+
+function posOnEvent(pathStr, data, isPatch) {
+  if (!pathStr || pathStr === '/') {
+    if (!isPatch) posByTag = {};
+    if (data) Object.keys(data).forEach(function (t) { posSetRec(t, data[t]); });
+    return;
+  }
+  var tag = pathStr.slice(1);
+  if (data === null) { delete posByTag[tag]; return; }
+  if (isPatch && posByTag[tag] && posByTag[tag].active) {
+    var merged = {};
+    Object.keys(posByTag[tag]).forEach(function (k) { merged[k] = posByTag[tag][k]; });
+    Object.keys(data).forEach(function (k) { merged[k] = data[k]; });
+    posSetRec(tag, merged);
+    return;
+  }
+  posSetRec(tag, data);
+}
+
+function posSubscribe() {
+  if (!FB_BASE || !FB_PATH || posSrc) return;
+  try {
+    posSrc = new EventSource(FB_BASE + '/' + FB_PATH + '.json');
+    posSrc.addEventListener('put', function (e) {
+      try { var d = JSON.parse(e.data); posOnEvent(d.path, d.data, false); } catch (err) {}
+    });
+    posSrc.addEventListener('patch', function (e) {
+      try { var d = JSON.parse(e.data); posOnEvent(d.path, d.data, true); } catch (err) {}
+    });
+  } catch (e) { posSrc = null; }
+}
+posSubscribe();
+setInterval(posTick, 250);
+var posTestEl = document.getElementById('posTestToggle');
+if (posTestEl) posTestEl.addEventListener('change', function () {
+  posTest = !!posTestEl.checked;
+  if (!posTest) {
+    // Restore the event-driven marker immediately.
+    posForget('__agg'); posDriverTag = '';
+    try { renderRoute(); } catch (e) {}
+  }
+});
+
 /* ===== Presence heartbeat =====
    Publish-only: this page pings a derived "-presence" topic every
    60 s while visible, so the test-alerts page can show a "Watching
@@ -989,6 +1255,9 @@ if (HARDCODED_TOPIC) {
 (function () {
   try {
     var PRES_TOPIC = HARDCODED_TOPIC + '-presence';
+    var HB_KEY = 'follower_heartbeat_on'; // Heartbeat toggle (Maintenance section): persisted per page — the two followers share one origin, so each page needs its own key
+    var heartbeatOn = true;
+    try { heartbeatOn = localStorage.getItem(HB_KEY) !== '0'; } catch (e) {}
     var wid = null;
     try {
       wid = localStorage.getItem('follower_watcher_id');
@@ -1036,10 +1305,20 @@ if (HARDCODED_TOPIC) {
     var FP = fingerprint();
     function ping() {
       if (document.hidden) return;
+      if (!heartbeatOn) return;
       try {
         fetch('https://ntfy.sh/' + encodeURIComponent(PRES_TOPIC), { method: 'POST', body: 'W1|' + wid + '|' + FP })
           .then(function () {}, function () {});
       } catch (e) {}
+    }
+    var hbEl = document.getElementById('heartbeatToggle');
+    if (hbEl) {
+      hbEl.checked = heartbeatOn;
+      hbEl.addEventListener('change', function () {
+        heartbeatOn = !!hbEl.checked;
+        try { localStorage.setItem(HB_KEY, heartbeatOn ? '1' : '0'); } catch (e) {}
+        if (heartbeatOn) ping();
+      });
     }
     ping();
     setInterval(ping, 60000);
