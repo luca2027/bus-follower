@@ -1020,7 +1020,7 @@ var posByTag = {};     // tag -> latest record {lat,lng,acc,ts,route,active,labe
 var posAnim = {};      // marker key -> {lat, lng, marker} animated position
 var posMode = {};      // marker key -> 'live' | 'stale' (absent = event-driven)
 var posDriverTag = ''; // aggregate mode: tag whose position drives the dot
-var posTest = true;    // Position test toggle — ON by default at Domi's direction (2026-10-31, 'for now'); memory-only, never stored
+var posTest = false;   // Position test — OFF by default per Luca (2026-11-01); toggle removed with the Maintenance section, memory-only, never stored
 var posSrc = null;
 
 function posProject(lat, lng, pts) {
