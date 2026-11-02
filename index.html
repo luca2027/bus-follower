@@ -79,7 +79,7 @@
 </head>
 <body>
 <header>
-  <h1>&#x1F68C; Bus Follower <span id="ver" style="font-size:0.6em;opacity:0.7;font-weight:normal;">v6.35</span></h1>
+  <h1>&#x1F68C; Bus Follower <span id="ver" style="font-size:0.6em;opacity:0.7;font-weight:normal;">v6.40</span></h1>
   <div class="seg">
     <button id="btnAM" class="on">AM</button>
     <button id="btnPM">PM</button>
@@ -691,7 +691,7 @@ function renderRoute() {
     var f = list[list.length - 1];
     busMarker = L.marker([f.lat, f.lng], {
       icon: L.divIcon({ className: '', html: '<div class="arrivedlbl">\u2713 Arrived</div>', iconSize: [110, 32], iconAnchor: [55, -18] }),
-      zIndexOffset: 1000, interactive: false
+      zIndexOffset: 1000
     }).addTo(map);
   } else if (st.done && st.offStop && allDevicesDone(route)) {
     // Only show the aggregate off-bus banner when ALL phones are done.
@@ -703,7 +703,7 @@ function renderRoute() {
     var agOffText = '\uD83D\uDCF1 ' + (_offDev ? '[' + _offDev + ']' + _offLbl + ' ' : '') + 'Off bus at ' + (agOff ? stopShort(agOff) : 'Stop ' + st.offStop);
     if (agOff) busMarker = L.marker([agOff.lat, agOff.lng], {
       icon: L.divIcon({ className: '', html: '<div class="gotofflbl">' + esc(agOffText) + '</div>', iconSize: [220, 32], iconAnchor: [110, -18] }),
-      zIndexOffset: 1000, interactive: false
+      zIndexOffset: 1000
     }).addTo(map).bindPopup('<b>' + esc(agOffText) + '</b><br><i>Tracking stopped</i>');
   } else if (st.waiting && st.busIdx < 0) {
     var agWait = stopByKey(route, st.waiting);
@@ -719,7 +719,7 @@ function renderRoute() {
     var waitText = '\uD83D\uDCF1 ' + (waitDevLbl ? '[' + waitDevLbl + ']' + _wLbl + ' ' : '') + 'Waiting for bus at ' + (agWait ? stopShort(agWait) : 'Stop ' + st.waiting);
     if (agWait) busMarker = L.marker([agWait.lat, agWait.lng], {
       icon: L.divIcon({ className: '', html: '<div class="waitlbl" style="white-space:normal;line-height:1.3;padding:6px 14px;">' + esc(waitText) + '</div>', iconSize: [240, 52], iconAnchor: [120, -30] }),
-      zIndexOffset: 1000, interactive: false
+      zIndexOffset: 1000
     }).addTo(map).bindPopup('<b>' + esc(waitText) + '</b>');
   } else if (st.busIdx >= 0 && st.busIdx < list.length) {
     var b = list[st.busIdx];
@@ -1027,7 +1027,7 @@ if (HARDCODED_TOPIC) {
 }
 // Re-backfill when tab becomes visible again (mobile browsers suspend SSE in background tabs)
 
-/* ===== Live Tracker (v6.35) =====
+/* ===== Live Tracker (v6.40) =====
    Position layer: subscribes to the Firebase Realtime Database
    position records (REST/SSE, SDK-free) and glides the bus marker
    along the route line between stop events. SEPARATE from the event
@@ -1087,7 +1087,61 @@ function posStaleNoteFor(tag) {
 }
 function posStaleNoteAgg() { return posStaleNoteFor(posDriverTag); }
 
-function posForget(key) { delete posMode[key]; delete posAnim[key]; }
+function posForget(key) { delete posMode[key]; delete posAnim[key]; delete posIconMark[key]; }
+
+/* ===== Position dot popup (v6.37) =====
+   One compose for both dot modes, mirroring the test branch's
+   last-writer-wins discipline (renderRoute rebinds the event popup
+   at its next render; the next fix restores this block). Production:
+   device + route + freshness + accuracy \u2014 no coordinates.
+   Position test: the same lines plus the GPS block (raw coordinates
+   + fix time). Stale wording is composed once, at the stale
+   transition, per mode. */
+function posPopupHtml(key, rec, stale) {
+  var tag = key === '__agg' ? (posDriverTag || rec.tag || '') : key;
+  var lines = [(rec.label ? '<b>' + esc(rec.label) + '</b> ' : '') + '[' + esc(tag) + ']',
+    route === 'AM' ? 'AM route' : 'PM route'];
+  if (stale) {
+    var mins = Math.max(1, Math.round((Date.now() - (rec.ts || 0)) / 60000));
+    lines.push('\uD83D\uDCCD Last seen ' + new Date(rec.ts).toLocaleTimeString() + ' (' + mins + ' min ago)');
+  } else {
+    lines.push('Live \u00B7 fix ' + Math.max(0, Math.round((Date.now() - (rec.ts || 0)) / 1000)) + ' s ago');
+  }
+  if (typeof rec.acc === 'number') lines.push('Accuracy \u00B1' + Math.round(rec.acc) + ' m');
+  var html = lines.join('<br>');
+  if (posTest && key === '__agg') {
+    html += '<div style="border-top:1px solid #ddd;margin-top:5px;padding-top:5px">'
+      + rec.lat.toFixed(6) + ', ' + rec.lng.toFixed(6)
+      + '<br>fix ' + new Date(rec.ts).toLocaleTimeString() + '</div>';
+  }
+  return html;
+}
+function posSetPopup(key, marker, rec, stale) {
+  try {
+    var html = posPopupHtml(key, rec, stale);
+    if (marker.getPopup && marker.getPopup()) marker.setPopupContent(html);
+    else marker.bindPopup(html);
+  } catch (e) {}
+}
+
+/* ===== Marker-instance icon state (v6.38) =====
+   Icon state is keyed to the marker INSTANCE, not just the stream:
+   renderRoute recreates markers on every render, and a recreated
+   marker must receive the icon (and the stale popup) its stream's
+   state calls for, even when the live/stale transition fired for
+   its predecessor. posApplyIcon no-ops when the driven marker
+   already carries the right icon, so steady drives cost nothing.
+   The record is cleared by posForget (ride end / off-route drop). */
+var posIconMark = {}; // key -> {marker, stale}
+function posNeedsIcon(key, marker, stale) {
+  var applied = posIconMark[key];
+  return !(applied && applied.marker === marker && applied.stale === stale);
+}
+function posApplyIcon(key, marker, color, stale, dev) {
+  if (!posNeedsIcon(key, marker, stale)) return;
+  posIconMark[key] = { marker: marker, stale: stale };
+  try { marker.setIcon(posDotIcon(color, stale, dev)); } catch (e) {}
+}
 
 function posDriveMarker(key, marker, rec, color, dev) {
   if (!marker) return;
@@ -1115,16 +1169,17 @@ function posDriveMarker(key, marker, rec, color, dev) {
   if (age > POS_STALE_MS) {
     if (posMode[key] !== 'stale') {
       posMode[key] = 'stale';
-      try { marker.setIcon(posDotIcon(color, true, dev)); } catch (e) {}
       try { renderStatus(); } catch (e) {}
     }
+    if (posNeedsIcon(key, marker, true)) posSetPopup(key, marker, rec, true);
+    posApplyIcon(key, marker, color, true, dev);
     return; // dot stays at its last live spot, greyed
   }
   if (posMode[key] !== 'live') {
     posMode[key] = 'live';
-    try { marker.setIcon(posDotIcon(color, false, dev)); } catch (e) {}
     try { renderStatus(); } catch (e) {}
   }
+  posApplyIcon(key, marker, color, false, dev);
   if (raw) {
     // Position test: true coordinates — no projection, no glide —
     // and the popup carries the raw readout. renderRoute rebinds
@@ -1135,16 +1190,17 @@ function posDriveMarker(key, marker, rec, color, dev) {
     try { marker.setLatLng(target); } catch (e) {}
     if (pa.popupTs !== rec.ts) {
       pa.popupTs = rec.ts;
-      var html = '<b>Live GPS</b><br>' + rec.lat.toFixed(6) + ', ' + rec.lng.toFixed(6)
-        + '<br>acc ' + (typeof rec.acc === 'number' ? Math.round(rec.acc) + ' m' : '\u2014')
-        + ' \u00B7 ' + new Date(rec.ts).toLocaleTimeString();
-      try {
-        if (marker.getPopup && marker.getPopup()) marker.setPopupContent(html);
-        else marker.bindPopup(html);
-      } catch (e) {}
+      posSetPopup(key, marker, rec, false);
     }
     return;
   }
+  // Position dot popup: compose on each new fix, BEFORE the
+  // first-drive return below so a recreated marker gets its popup
+  // on its first drive. Shares the entry (and the popupTs gate)
+  // with the animation state.
+  var pp = posAnim[key];
+  if (!pp || pp.marker !== marker) { pp = { lat: target[0], lng: target[1], marker: marker, popupTs: 0 }; posAnim[key] = pp; }
+  if (pp.popupTs !== rec.ts) { pp.popupTs = rec.ts; posSetPopup(key, marker, rec, false); }
   var cur = posAnim[key];
   if (!cur || cur.marker !== marker) {
     try { marker.setLatLng(target); } catch (e) {}
