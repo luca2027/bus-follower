@@ -66,6 +66,12 @@
   .devrow input[type=checkbox] { width:18px; height:18px; accent-color:var(--acc); flex:none; }
   .devdot { width:14px; height:14px; border-radius:50%; flex:none; }
   .devhint { color:var(--mut); font-size:.85rem; padding:6px 0; }
+  .tagrow { display:block; padding:8px 0 6px; }
+  .taglabel { font-size:.9rem; line-height:1.35; }
+  .tagid { font-family:monospace; font-size:11.5px; word-break:break-all; background:#12241a; border:1px solid #223129; border-radius:6px; padding:5px 7px; margin:6px 0; opacity:.92; }
+  .tagform { display:flex; gap:6px; }
+  .tagform input { flex:1; min-width:0; }
+  .taghint { font-size:11.5px; opacity:.65; margin-top:5px; line-height:1.35; }
   .devbuslbl { background:rgba(0,0,0,.7); color:#fff; font-size:11px; font-weight:800; padding:1px 7px; border-radius:10px; text-align:center; white-space:nowrap; margin-top:2px; }
   .waitlbl { background:#b45309; color:#fff; font-weight:700; font-size:12px; padding:5px 16px; border-radius:18px; text-align:center; white-space:nowrap; box-shadow:0 2px 6px rgba(0,0,0,.35); }
   .gotofflbl { background:#475569; color:#fff; font-weight:700; font-size:12px; padding:5px 16px; border-radius:18px; text-align:center; white-space:nowrap; box-shadow:0 2px 6px rgba(0,0,0,.35); }
@@ -80,7 +86,7 @@
 </head>
 <body>
 <header>
-  <h1>&#x1F68C; Bus Follower <span id="ver" style="font-size:0.6em;opacity:0.7;font-weight:normal;">v6.44</span></h1>
+  <h1>&#x1F68C; Bus Follower <span id="ver" style="font-size:0.6em;opacity:0.7;font-weight:normal;">v6.46</span></h1>
   <div class="seg">
     <button id="btnAM" class="on">AM</button>
     <button id="btnPM">PM</button>
@@ -1034,7 +1040,7 @@ if (HARDCODED_TOPIC) {
 }
 // Re-backfill when tab becomes visible again (mobile browsers suspend SSE in background tabs)
 
-/* ===== Live Tracker (v6.44) =====
+/* ===== Live Tracker (v6.46) =====
    Position layer: subscribes to the Firebase Realtime Database
    position records (REST/SSE, SDK-free) and glides the bus marker
    along the route line between stop events. SEPARATE from the event
@@ -1150,7 +1156,7 @@ var posPillAgg = null; // {html, w, h} for the aggregate key, or null
 var posPillDev = {}; // dev -> {html, w, h}
 function posPillFor(key) { return key === '__agg' ? posPillAgg : (posPillDev[key] || null); }
 function posPillKey(key) { var p = posPillFor(key); return p ? p.html : ''; }
-// (v6.44) Speed chip + bus icon: the driven stack gains a
+// (v6.46) Speed chip + bus icon: the driven stack gains a
 // speed chip BELOW the centre (writer-reported spd on the position
 // record; shown always while the dot is live, hidden when stale)
 // and, while the device is on the bus, a bare bus glyph in place
@@ -1539,11 +1545,25 @@ if (showTestsEl) {
       return fnv(parts.join('|'));
     }
     var FP = fingerprint();
+    /* Watcher name tag (v6.46): one shared tag per browser
+       (localStorage follower_tag_name), appended to every heartbeat
+       as -<tag>; defaults to "blank" until a name is set. */
+    var TAG_KEY = 'follower_tag_name';
+    function cleanTag(s) {
+      var t = String(s == null ? '' : s).replace(/[^A-Za-z0-9-]/g, '').slice(0, 16);
+      return t === '' ? 'blank' : t;
+    }
+    function readTag() {
+      var v = null;
+      try { v = localStorage.getItem(TAG_KEY); } catch (e) {}
+      return cleanTag(v == null ? '' : v);
+    }
+    function heartbeatBody() { return 'W1|' + wid + '|' + FP + '-' + readTag(); }
     function ping() {
       if (document.hidden) return;
       if (!heartbeatOn) return;
       try {
-        fetch('https://ntfy.sh/' + encodeURIComponent(PRES_TOPIC), { method: 'POST', body: 'W1|' + wid + '|' + FP })
+        fetch('https://ntfy.sh/' + encodeURIComponent(PRES_TOPIC), { method: 'POST', body: heartbeatBody() })
           .then(function () {}, function () {});
       } catch (e) {}
     }
@@ -1556,8 +1576,28 @@ if (showTestsEl) {
         if (heartbeatOn) ping();
       });
     }
+    /* Watcher name row (Maintenance): preview + box + Save.
+       CQ1: the ID line refreshes on Save and on every 60 s tick; the
+       box refreshes on a tick only when it is not focused. */
+    var tagBox = document.getElementById('tagNameBox');
+    var tagIdEl = document.getElementById('tagIdLine');
+    var tagSaveBtn = document.getElementById('tagSaveBtn');
+    function tagRefresh(forceBox) {
+      if (tagIdEl) tagIdEl.innerHTML = 'W1|' + wid + '|' + FP + '<b>-' + readTag() + '</b>';
+      if (tagBox && (forceBox || document.activeElement !== tagBox)) tagBox.value = readTag();
+    }
+    if (tagSaveBtn && tagBox) {
+      tagSaveBtn.addEventListener('click', function () {
+        var t = cleanTag(tagBox.value);
+        try { localStorage.setItem(TAG_KEY, t); } catch (e) {}
+        tagBox.value = t;
+        tagRefresh(false);
+        ping();
+      });
+    }
+    tagRefresh(true);
     ping();
-    setInterval(ping, 60000);
+    setInterval(function () { ping(); tagRefresh(false); }, 60000);
     document.addEventListener('visibilitychange', function () { if (!document.hidden) ping(); });
   } catch (e) {}
 })();
