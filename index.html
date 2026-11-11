@@ -1547,18 +1547,18 @@ if (showTestsEl) {
     var FP = fingerprint();
     /* Watcher name tag (v6.46): one shared tag per browser
        (localStorage follower_tag_name), appended to every heartbeat
-       as -<tag>; defaults to "blank" until a name is set. */
+       as -<tag>; empty until a name is set. */
     var TAG_KEY = 'follower_tag_name';
     function cleanTag(s) {
       var t = String(s == null ? '' : s).replace(/[^A-Za-z0-9-]/g, '').slice(0, 16);
-      return t === '' ? 'blank' : t;
+      return t;
     }
     function readTag() {
       var v = null;
       try { v = localStorage.getItem(TAG_KEY); } catch (e) {}
       return cleanTag(v == null ? '' : v);
     }
-    function heartbeatBody() { return 'W1|' + wid + '|' + FP + '-' + readTag(); }
+    function heartbeatBody() { var t = readTag(); return 'W1|' + wid + '|' + FP + (t ? '-' + t : ''); }
     function ping() {
       if (document.hidden) return;
       if (!heartbeatOn) return;
@@ -1583,7 +1583,7 @@ if (showTestsEl) {
     var tagIdEl = document.getElementById('tagIdLine');
     var tagSaveBtn = document.getElementById('tagSaveBtn');
     function tagRefresh(forceBox) {
-      if (tagIdEl) tagIdEl.innerHTML = 'W1|' + wid + '|' + FP + '<b>-' + readTag() + '</b>';
+      if (tagIdEl) { var t = readTag(); tagIdEl.innerHTML = 'W1|' + wid + '|' + FP + (t ? '<b>-' + t + '</b>' : ''); }
       if (tagBox && (forceBox || document.activeElement !== tagBox)) tagBox.value = readTag();
     }
     if (tagSaveBtn && tagBox) {
